@@ -4,9 +4,13 @@
 #include <string>
 
 // Mod Metadata (32-bit Target)
-MYMOD(net.retro.vehicledummydumper, VehicleDummyDumper, 1.0, Retro)
+MYMOD(net.retro.vehcfunc, VehcFunc, 1.0, Retro)
 NEEDGAME(com.rockstargames.gtasa)
 
+
+BEGIN_DEPLIST()
+ADD_DEPENDENCY_VER(net.rusjj.aml, 1.4.0)
+END_DEPLIST()
 // RenderWare 32-bit Data Structures
 struct RwObject {
     uint8_t type;
