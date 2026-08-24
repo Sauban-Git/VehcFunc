@@ -3,14 +3,14 @@
 #include <fstream>
 #include <string>
 
-// Mod Metadata (32-bit Target)
+// Mod Metadata and Dependencies
 MYMOD(net.retro.vehcfunc, VehcFunc, 1.0, Retro)
 NEEDGAME(com.rockstargames.gtasa)
 
-
 BEGIN_DEPLIST()
-ADD_DEPENDENCY_VER(net.rusjj.aml, 1.4.0)
+    ADD_DEPENDENCY_VER(net.rusjj.aml, 1.4.0)
 END_DEPLIST()
+
 // RenderWare 32-bit Data Structures
 struct RwObject {
     uint8_t type;
@@ -44,14 +44,12 @@ struct RpClump {
     RwObject object;
 };
 
-// Function Pointers (Using your verified 32-bit offsets)
+// Function Pointers
 typedef void* (*FindPlayerVehicle_t)(int playerId, bool bIncludeBicycles);
 typedef const char* (*GetFrameNodeName_t)(RwFrame* frame);
-typedef void (*PlayerPed_ProcessControl_t)(void* ped);
 
-FindPlayerVehicle_t     FindPlayerVehicle = nullptr;
-GetFrameNodeName_t      GetFrameNodeName  = nullptr;
-PlayerPed_ProcessControl_t old_CPlayerPed_ProcessControl = nullptr;
+FindPlayerVehicle_t FindPlayerVehicle = nullptr;
+GetFrameNodeName_t  GetFrameNodeName  = nullptr;
 
 // Tracking state to ensure vehicle is only logged once per entry
 static void* g_pLastLoggedVehicle = nullptr;
@@ -68,33 +66,30 @@ void DumpFrameHierarchy(RwFrame* frame, std::ofstream& logFile, int depth = 0) {
         }
     }
 
-    // Traverse child sub-frames (nested dummies/components)
     if (frame->child) {
         DumpFrameHierarchy(frame->child, logFile, depth + 1);
     }
 
-    // Traverse sibling frames (parallel dummies at same depth)
     if (frame->next) {
         DumpFrameHierarchy(frame->next, logFile, depth);
     }
 }
 
-// Hooked CPlayerPed::ProcessControl (0x004C4778)
-void hook_CPlayerPed_ProcessControl(void* ped) {
-    if (old_CPlayerPed_ProcessControl) {
-        old_CPlayerPed_ProcessControl(ped);
-    }
+// Hook CPlayerPed::ProcessControl
+DECL_HOOKv(CPlayerPed_ProcessControl, void* self)
+{
+    CPlayerPed_ProcessControl(self);
 
     if (!FindPlayerVehicle) return;
 
-    // Retrieve active vehicle driven by player
     void* pVehicle = FindPlayerVehicle(-1, false);
 
-    // If driving a vehicle and it's a new entry, dump all dummy nodes
     if (pVehicle && pVehicle != g_pLastLoggedVehicle) {
         g_pLastLoggedVehicle = pVehicle;
 
-        std::ofstream logFile("/sdcard/Android/data/com.rockstargames.gtasa/files/properties.log", std::ios::out | std::ios::trunc);
+        std::string logPath = std::string(aml->GetAndroidDataPath()) + "/properties.log";
+        std::ofstream logFile(logPath, std::ios::out | std::ios::trunc);
+
         if (logFile.is_open()) {
             logFile << "===========================================\n";
             logFile << "  DRIVEN VEHICLE DUMMY NODE PROPERTY DUMP  \n";
@@ -117,30 +112,27 @@ void hook_CPlayerPed_ProcessControl(void* ped) {
             logger->Error("Failed to open properties.log for writing!");
         }
     } else if (!pVehicle) {
-        // Reset tracking pointer when player steps out of vehicle
         g_pLastLoggedVehicle = nullptr;
     }
 }
 
-ON_MOD_PRELOAD() {
-    logger->SetTag("VehicleDummyDumper");
+ON_MOD_PRELOAD()
+{
+    logger->SetTag("VehcFunc");
 }
 
-ON_MOD_LOAD() {
+ON_MOD_LOAD()
+{
     uintptr_t pGTASA = aml->GetLib("libGTASA.so");
     if (!pGTASA) {
         logger->Error("Failed to locate libGTASA.so!");
         return;
     }
 
-    // Resolve functions using your verified 32-bit addresses (+1 for Thumb mode)
-    GetFrameNodeName = (GetFrameNodeName_t)(pGTASA + 0x0048241C + 1);
-    FindPlayerVehicle = (FindPlayerVehicle_t)(pGTASA + 0x0040B530 + 1);
+    SET_TO(GetFrameNodeName, pGTASA + BYBIT(0x0048241C + 1, 0x0));
+    SET_TO(FindPlayerVehicle, pGTASA + BYBIT(0x0040B530 + 1, 0x0));
 
-    // Hook CPlayerPed::ProcessControl (0x004C4778)
-    uintptr_t pProcessControl = pGTASA + 0x004C4778 + 1;
-    aml->Redirect(pProcessControl, (uintptr_t)hook_CPlayerPed_ProcessControl, (uintptr_t*)&old_CPlayerPed_ProcessControl);
+    HOOK(CPlayerPed_ProcessControl, pGTASA + BYBIT(0x004C4778 + 1, 0x0));
 
-    logger->Info("VehicleDummyDumper 32-bit loaded. Ready to dump player vehicle nodes.");
+    logger->Info("VehcFunc loaded successfully.");
 }
-
