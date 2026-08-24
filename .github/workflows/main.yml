@@ -1,0 +1,38 @@
+name: AML Mod Compiler
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository...
+        uses: actions/checkout@v4
+
+      - name: Download AndroidModLoader's mod template...
+        uses: wei/wget@v1
+        with:
+          args: -O ./AML_src.zip https://github.com/RusJJ/AndroidModLoader/archive/refs/heads/main.zip
+
+      - name: Install AndroidModLoader's mod template...
+        run: |
+          unzip ./AML_src.zip
+          mv ./AndroidModLoader-main/mod ./mod
+
+      - name: Get SAUtils...
+        uses: wei/wget@v1
+        with:
+          args: -O ./isautils.h https://github.com/AndroidModLoader/SAUtils/raw/main/isautils.h
+
+      - name: Build the code...
+        run: $ANDROID_NDK_LATEST_HOME/ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=./Android.mk NDK_APPLICATION_MK=./Application.mk
+
+      - name: Upload the mod!
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-mod
+          path: ./libs
