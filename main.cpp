@@ -5,7 +5,6 @@
 #include <set>
 #include <algorithm>
 #include <cstdlib>
-#include <iomanip>
 
 MYMOD(net.retro.vehcfunc, VehcFunc, 1.0, Retro)
 NEEDGAME(com.rockstargames.gtasa)
@@ -43,8 +42,8 @@ struct RwLinkList {
 struct RwFrame {
     RwObject   object;
     RwLLLink   inDirtyList;
-    RwMatrix   modelling;
-    RwMatrix   ltm;
+    RwMatrix   modelling; // Local offset matrix
+    RwMatrix   ltm;       // World position matrix
     RwLinkList objectList;
     RwFrame*   child;
     RwFrame*   next;
@@ -82,12 +81,25 @@ struct RwAtomic {
 };
 
 // ==========================================
-// GLOBALS & HELPERS
+// GLOBALS, HELPERS & ENGINE FUNCTIONS
 // ==========================================
 typedef const char* (*GetFrameNodeName_t)(RwFrame* frame);
 GetFrameNodeName_t GetFrameNodeName = nullptr;
 
+// Signature for CCoronas::RegisterCorona (Matches 0x005A39B0 overload)
+typedef void (*RegisterCorona_t)(
+    uint32_t id, void* attachTo, 
+    uint8_t r, uint8_t g, uint8_t b, uint8_t a, 
+    RwV3d* pos, float radius, float farClip, 
+    uint8_t coronaType, uint8_t flareType, 
+    bool enableReflection, bool checkLOS, 
+    int unused, float angle, bool longDistance, 
+    float nearClip, bool bFadeInOut
+);
+RegisterCorona_t RegisterCorona = nullptr;
+
 static std::set<uintptr_t> g_loggedVehicles;
+static std::set<RwFrame*>  g_litLoggedNodes;
 
 inline bool IsValidPointer(uintptr_t ptr) {
     return (ptr >= 0x10000000 && ptr <= 0xF0000000 && (ptr % 4 == 0));
@@ -107,54 +119,52 @@ RwFrame* GetVehicleRootFrame(void* pVehicle) {
 }
 
 // ==========================================
-// FEATURE 1: HIERARCHY LOGGER
+// FEATURE 1: TARGETED DETECTION LOGGER
 // ==========================================
-void DumpFrameHierarchy(RwFrame* frame, std::ofstream& logFile, int depth = 0) {
-    if (!frame || !IsValidPointer((uintptr_t)frame) || depth > 30) return;
+void DumpBrakeNodesOnly(RwFrame* frame, std::ofstream& logFile) {
+    if (!frame || !IsValidPointer((uintptr_t)frame)) return;
 
     if (GetFrameNodeName) {
         const char* nodeName = GetFrameNodeName(frame);
         if (nodeName && IsValidPointer((uintptr_t)nodeName) && nodeName[0] != '\0') {
-            std::string indent(depth * 2, ' ');
-            logFile << indent << "[Node] " << nodeName << "\n";
+            std::string name(nodeName);
+            std::string nameLower = name;
+            std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
+
+            if (nameLower.find("break") != std::string::npos || nameLower.find("brake") != std::string::npos) {
+                logFile << "[Detected Brake Node] " << name << "\n";
+            }
         }
     }
 
-    if (frame->child && IsValidPointer((uintptr_t)frame->child)) {
-        DumpFrameHierarchy(frame->child, logFile, depth + 1);
-    }
-    if (frame->next && IsValidPointer((uintptr_t)frame->next)) {
-        DumpFrameHierarchy(frame->next, logFile, depth);
-    }
+    if (frame->child) DumpBrakeNodesOnly(frame->child, logFile);
+    if (frame->next)  DumpBrakeNodesOnly(frame->next, logFile);
 }
 
 void LogVehicle(void* pVehicle) {
     if (!pVehicle) return;
     uintptr_t vehAddr = (uintptr_t)pVehicle;
-    if (g_loggedVehicles.count(vehAddr)) return; // Log only once per vehicle
+    if (g_loggedVehicles.count(vehAddr)) return; 
 
     RwFrame* rootFrame = GetVehicleRootFrame(pVehicle);
     if (!rootFrame) return;
 
     g_loggedVehicles.insert(vehAddr);
-    uint16_t modelId = *(uint16_t*)(vehAddr + 0x22);
 
     std::string logPath = std::string(aml->GetAndroidDataPath()) + "/properties.log";
     std::ofstream logFile(logPath, std::ios::out | std::ios::app);
     if (logFile.is_open()) {
         logFile << "===========================================\n";
-        logFile << "  Vehicle Pointer: 0x" << std::hex << vehAddr << "\n";
-        logFile << "  Model ID: " << std::dec << modelId << "\n";
+        logFile << "  Scanning Vehicle: 0x" << std::hex << vehAddr << "\n";
         logFile << "===========================================\n";
-        DumpFrameHierarchy(rootFrame, logFile, 0);
+        DumpBrakeNodesOnly(rootFrame, logFile);
         logFile << "\n";
         logFile.close();
-        logger->Info("Logged vehicle model %d", modelId);
     }
 }
 
 // ==========================================
-// FEATURE 2: BRAKE LIGHT CONTROLLER
+// FEATURE 2: DYNAMIC BRAKE LIGHTS & CORONAS
 // ==========================================
 bool ParsePrmColor(const std::string& name, RwRGBA& outColor) {
     size_t pos = name.find("prm");
@@ -167,11 +177,6 @@ bool ParsePrmColor(const std::string& name, RwRGBA& outColor) {
     outColor.g = (hexVal >> 8) & 0xFF;
     outColor.b = hexVal & 0xFF;
     outColor.a = 255;
-
-    if (pos + 12 <= name.length()) {
-        int alphaVal = std::atoi(name.substr(pos + 9, 3).c_str());
-        if (alphaVal > 0) outColor.a = (uint8_t)std::min(alphaVal, 255);
-    }
     return true;
 }
 
@@ -181,12 +186,10 @@ void ProcessFrameAtomics(RwFrame* frame, RwRGBA color) {
 
     while (cur && cur != end) {
         RwAtomic* atomic = (RwAtomic*)((uintptr_t)cur - offsetof(RwAtomic, inFrameList));
-        if (atomic && atomic->object.type == 1) { // 1 = rpATOMIC
-            if (atomic->geometry && atomic->geometry->matList.materials) {
-                for (int i = 0; i < atomic->geometry->matList.numMaterials; ++i) {
-                    if (atomic->geometry->matList.materials[i]) {
-                        atomic->geometry->matList.materials[i]->color = color;
-                    }
+        if (atomic && atomic->object.type == 1 && atomic->geometry && atomic->geometry->matList.materials) {
+            for (int i = 0; i < atomic->geometry->matList.numMaterials; ++i) {
+                if (atomic->geometry->matList.materials[i]) {
+                    atomic->geometry->matList.materials[i]->color = color;
                 }
             }
         }
@@ -194,35 +197,63 @@ void ProcessFrameAtomics(RwFrame* frame, RwRGBA color) {
     }
 }
 
-void UpdateBrakeNodes(RwFrame* frame, bool isBraking, bool isLightsOn) {
+void UpdateBrakeNodes(RwFrame* frame, void* pVehicle, bool isBraking, bool isLightsOn) {
     if (!frame || !IsValidPointer((uintptr_t)frame)) return;
 
     if (GetFrameNodeName) {
         const char* nodeName = GetFrameNodeName(frame);
         if (nodeName && IsValidPointer((uintptr_t)nodeName) && nodeName[0] != '\0') {
             std::string name(nodeName);
-            std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+            std::string nameLower = name;
+            std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
 
-            if (name.find("break") != std::string::npos || name.find("brake") != std::string::npos) {
+            if (nameLower.find("break") != std::string::npos || nameLower.find("brake") != std::string::npos) {
                 RwRGBA targetColor;
+
                 if (isBraking) {
-                    if (!ParsePrmColor(name, targetColor)) targetColor = { 255, 0, 0, 255 }; // Full Red
-                } else if (isLightsOn) {
-                    if (ParsePrmColor(name, targetColor)) {
-                        targetColor.r /= 2; targetColor.g /= 2; targetColor.b /= 2; targetColor.a = 120;
-                    } else {
-                        targetColor = { 100, 0, 0, 120 }; // Dim Red
+                    if (!ParsePrmColor(nameLower, targetColor)) {
+                        targetColor = { 255, 60, 60, 255 }; 
                     }
+
+                    ProcessFrameAtomics(frame, targetColor);
+
+                    if (RegisterCorona) {
+                        uint32_t coronaID = (uint32_t)frame + 0x1000; 
+                        RegisterCorona(
+                            coronaID, pVehicle, 
+                            targetColor.r, targetColor.g, targetColor.b, 255, 
+                            &frame->ltm.pos, 
+                            0.8f, 50.0f, 
+                            1, 0, false, false, 0, 0.0f, false, 0.5f, false 
+                        );
+                    }
+
+                    if (g_litLoggedNodes.find(frame) == g_litLoggedNodes.end()) {
+                        g_litLoggedNodes.insert(frame);
+                        std::string logPath = std::string(aml->GetAndroidDataPath()) + "/properties.log";
+                        std::ofstream logFile(logPath, std::ios::out | std::ios::app);
+                        if (logFile.is_open()) {
+                            logFile << "[Event] Lit node: " << name 
+                                    << " | RGBA: (" << (int)targetColor.r << "," 
+                                    << (int)targetColor.g << "," << (int)targetColor.b << ")\n";
+                            logFile.close();
+                        }
+                    }
+                } else if (isLightsOn) {
+                    targetColor = { 80, 0, 0, 100 };
+                    ProcessFrameAtomics(frame, targetColor);
+                    g_litLoggedNodes.erase(frame);
                 } else {
-                    targetColor = { 30, 30, 30, 0 }; // Off
+                    targetColor = { 30, 30, 30, 0 };
+                    ProcessFrameAtomics(frame, targetColor);
+                    g_litLoggedNodes.erase(frame);
                 }
-                ProcessFrameAtomics(frame, targetColor);
             }
         }
     }
 
-    if (frame->child) UpdateBrakeNodes(frame->child, isBraking, isLightsOn);
-    if (frame->next)  UpdateBrakeNodes(frame->next, isBraking, isLightsOn);
+    if (frame->child) UpdateBrakeNodes(frame->child, pVehicle, isBraking, isLightsOn);
+    if (frame->next)  UpdateBrakeNodes(frame->next, pVehicle, isBraking, isLightsOn);
 }
 
 void ProcessVehicleBrakeLights(void* pVehicle) {
@@ -236,7 +267,7 @@ void ProcessVehicleBrakeLights(void* pVehicle) {
     bool isLightsOn = (lightMode == 2);
 
     RwFrame* rootFrame = GetVehicleRootFrame(pVehicle);
-    if (rootFrame) UpdateBrakeNodes(rootFrame, isBraking, isLightsOn);
+    if (rootFrame) UpdateBrakeNodes(rootFrame, pVehicle, isBraking, isLightsOn);
 }
 
 // ==========================================
@@ -247,50 +278,10 @@ DECL_HOOKv(CAutomobile_ProcessControl, void* self) {
     LogVehicle(self); 
     ProcessVehicleBrakeLights(self); 
 }
-DECL_HOOKv(CBike_ProcessControl, void* self) { 
-    CBike_ProcessControl(self); 
-    LogVehicle(self); 
-    ProcessVehicleBrakeLights(self); 
-}
-DECL_HOOKv(CBoat_ProcessControl, void* self) { 
-    CBoat_ProcessControl(self); 
-    LogVehicle(self); 
-    ProcessVehicleBrakeLights(self); 
-}
-DECL_HOOKv(CHeli_ProcessControl, void* self) { 
-    CHeli_ProcessControl(self); 
-    LogVehicle(self); 
-    ProcessVehicleBrakeLights(self); 
-}
-DECL_HOOKv(CPlane_ProcessControl, void* self) { 
-    CPlane_ProcessControl(self); 
-    LogVehicle(self); 
-    ProcessVehicleBrakeLights(self); 
-}
-DECL_HOOKv(CMonsterTruck_ProcessControl, void* self) { 
-    CMonsterTruck_ProcessControl(self); 
-    LogVehicle(self); 
-    ProcessVehicleBrakeLights(self); 
-}
-DECL_HOOKv(CQuadBike_ProcessControl, void* self) { 
-    CQuadBike_ProcessControl(self); 
-    LogVehicle(self); 
-    ProcessVehicleBrakeLights(self); 
-}
-DECL_HOOKv(CTrailer_ProcessControl, void* self) { 
-    CTrailer_ProcessControl(self); 
-    LogVehicle(self); 
-    ProcessVehicleBrakeLights(self); 
-}
-DECL_HOOKv(CBmx_ProcessControl, void* self) { 
-    CBmx_ProcessControl(self); 
-    LogVehicle(self); 
-    ProcessVehicleBrakeLights(self); 
-}
+DECL_HOOKv(CBike_ProcessControl, void* self) { CBike_ProcessControl(self); LogVehicle(self); ProcessVehicleBrakeLights(self); }
+DECL_HOOKv(CQuadBike_ProcessControl, void* self) { CQuadBike_ProcessControl(self); LogVehicle(self); ProcessVehicleBrakeLights(self); }
+DECL_HOOKv(CMonsterTruck_ProcessControl, void* self) { CMonsterTruck_ProcessControl(self); LogVehicle(self); ProcessVehicleBrakeLights(self); }
 
-// ==========================================
-// INITIALIZATION
-// ==========================================
 ON_MOD_PRELOAD() {
     logger->SetTag("VehcFunc");
 }
@@ -302,22 +293,19 @@ ON_MOD_LOAD() {
         return;
     }
 
-    // Clear old log
     std::string logPath = std::string(aml->GetAndroidDataPath()) + "/properties.log";
     std::ofstream clearLog(logPath, std::ios::out | std::ios::trunc);
     if (clearLog.is_open()) clearLog.close();
 
     SET_TO(GetFrameNodeName, pGTASA + BYBIT(0x0048241C + 1, 0x0));
+    
+    // Connected offset for RegisterCorona
+    SET_TO(RegisterCorona, pGTASA + BYBIT(0x005A39B0 + 1, 0x0));
 
     HOOK(CAutomobile_ProcessControl,   pGTASA + BYBIT(0x00553DD4 + 1, 0x0));
     HOOK(CBike_ProcessControl,         pGTASA + BYBIT(0x00561A20 + 1, 0x0));
-    HOOK(CBoat_ProcessControl,         pGTASA + BYBIT(0x0056BE50 + 1, 0x0));
-    HOOK(CHeli_ProcessControl,         pGTASA + BYBIT(0x00571238 + 1, 0x0));
-    HOOK(CPlane_ProcessControl,        pGTASA + BYBIT(0x00575C88 + 1, 0x0));
-    HOOK(CMonsterTruck_ProcessControl, pGTASA + BYBIT(0x005747F4 + 1, 0x0));
     HOOK(CQuadBike_ProcessControl,     pGTASA + BYBIT(0x0057A280 + 1, 0x0));
-    HOOK(CTrailer_ProcessControl,      pGTASA + BYBIT(0x0057B304 + 1, 0x0));
-    HOOK(CBmx_ProcessControl,          pGTASA + BYBIT(0x00568B14 + 1, 0x0));
+    HOOK(CMonsterTruck_ProcessControl, pGTASA + BYBIT(0x005747F4 + 1, 0x0));
 
-    logger->Info("VehcFunc loaded successfully.");
+    logger->Info("VehcFunc loaded with targeted brake log and coronas.");
 }
